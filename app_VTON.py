@@ -54,6 +54,9 @@ example_path = os.path.join(os.path.dirname(__file__), 'example')
 def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_crop, denoise_steps, is_randomize_seed, seed, number_of_images):
     global pipe, unet, UNet_Encoder, need_restart_cpu_offloading
 
+    print(f"Input dict from ImageEditor: {dict}") # Debug: Print the input dict
+    print(f"Full Input dict content: {dict}") # NEW DEBUG PRINT - Print the entire dict
+
     if pipe == None:
         unet = UNet2DConditionModel.from_pretrained(
             model_id,
@@ -62,9 +65,9 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         )
         if load_mode == '4bit':
             quantize_4bit(unet)
-            
+
         unet.requires_grad_(False)
-       
+
         image_encoder = CLIPVisionModelWithProjection.from_pretrained(
             model_id,
             subfolder="image_encoder",
@@ -72,10 +75,10 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
             )
         if load_mode == '4bit':
             quantize_4bit(image_encoder)
-        
+
         if fixed_vae:
             vae = AutoencoderKL.from_pretrained(vae_model_id, torch_dtype=dtype)
-        else:            
+        else:
             vae = AutoencoderKL.from_pretrained(model_id,
                                                 subfolder="vae",
                                                 torch_dtype=dtype,
@@ -87,7 +90,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
             subfolder="unet_encoder",
             torch_dtype=dtypeQuantize,
         )
-     
+
         if load_mode == '4bit':
             quantize_4bit(UNet_Encoder)
 
@@ -95,18 +98,18 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         image_encoder.requires_grad_(False)
         vae.requires_grad_(False)
         unet.requires_grad_(False)
-              
+
         pipe_param = {
                 'pretrained_model_name_or_path': model_id,
-                'unet': unet,     
-                'torch_dtype': dtype,   
+                'unet': unet,
+                'torch_dtype': dtype,
                 'vae': vae,
                 'image_encoder': image_encoder,
                 'feature_extractor': CLIPImageProcessor(),
             }
-        
+
         pipe = TryonPipeline.from_pretrained(**pipe_param).to(device)
-        pipe.unet_encoder = UNet_Encoder    
+        pipe.unet_encoder = UNet_Encoder
         pipe.unet_encoder.to(pipe.unet.device)
 
         if load_mode == '4bit':
@@ -114,12 +117,12 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                 quantize_4bit(pipe.text_encoder)
             if pipe.text_encoder_2 is not None:
                 quantize_4bit(pipe.text_encoder_2)
-           
+
     else:
         if ENABLE_CPU_OFFLOAD:
             need_restart_cpu_offloading =True
-    
-    torch_gc() 
+
+    torch_gc()
     parsing_model = Parsing(0)
     openpose_model = OpenPose(0)
     openpose_model.preprocessor.body_estimation.model.to(device)
@@ -129,18 +132,16 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                         transforms.Normalize([0.5], [0.5]),
                     ]
             )
-    
+
     if need_restart_cpu_offloading:
         restart_cpu_offload(pipe, load_mode)
     elif ENABLE_CPU_OFFLOAD:
         pipe.enable_model_cpu_offload()
 
-    #if load_mode != '4bit' :
-    #    pipe.enable_xformers_memory_efficient_attention()    
 
     garm_img= garm_img.convert("RGB").resize((768,1024))
-    human_img_orig = dict["background"].convert("RGB")    
-    
+    human_img_orig = dict["background"].convert("RGB")
+
     if is_checked_crop:
         width, height = human_img_orig.size
         target_width = int(min(width, height * (3 / 4)))
@@ -160,11 +161,27 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
         model_parse, _ = parsing_model(human_img.resize((384,512)))
         mask, mask_gray = get_mask_location('hd', category, model_parse, keypoints)
         mask = mask.resize((768,1024))
+        print("Auto-masking used")
     else:
-        mask = pil_to_binary_mask(dict['layers'][0].convert("RGB").resize((768, 1024)))
-        # mask = transforms.ToTensor()(mask)
-        # mask = mask.unsqueeze(0)
-    
+        # Manual mask branch: extract the alpha channel from the drawn layer.
+        if dict.get('layers') and len(dict['layers']) > 0 and dict['layers'][0] is not None:
+            mask_layer = dict['layers'][0]
+            # If the layer is in RGBA, extract the alpha channel.
+            if mask_layer.mode == "RGBA":
+                mask_alpha = mask_layer.split()[-1]  # Get the alpha channel
+            else:
+                mask_alpha = mask_layer.convert("L")
+            mask_alpha = mask_alpha.resize((768,1024))
+            print("Manual mask alpha extracted:", type(mask_alpha), mask_alpha.mode, mask_alpha.size)
+            mask = pil_to_binary_mask(mask_alpha)
+            print("Manual mask binary mask:", type(mask), mask.mode, mask.size)
+        else:
+            # Fallback to a default black mask if no manual drawing exists.
+            mask = Image.new('L', (768,1024), 0)
+            print("No manual mask provided, using default black mask")
+
+    print("Mask before pipe:", type(mask), mask.mode, mask.size) # Debug: Print mask just before pipe
+
     mask_gray = (1-transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray+1.0)/2.0)
 
@@ -173,11 +190,11 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
 
     args = apply_net.create_argument_parser().parse_args(('show', './configs/densepose_rcnn_R_50_FPN_s1x.yaml', './ckpt/densepose/model_final_162be9.pkl', 'dp_segm', '-v', '--opts', 'MODEL.DEVICE', 'cuda'))
     # verbosity = getattr(args, "verbosity", None)
-    pose_img = args.func(args,human_img_arg)    
-    pose_img = pose_img[:,:,::-1]    
+    pose_img = args.func(args,human_img_arg)
+    pose_img = pose_img[:,:,::-1]
     pose_img = Image.fromarray(pose_img).resize((768,1024))
-    
-    if pipe.text_encoder is not None:        
+
+    if pipe.text_encoder is not None:
         pipe.text_encoder.to(device)
 
     if pipe.text_encoder_2 is not None:
@@ -201,7 +218,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                         do_classifier_free_guidance=True,
                         negative_prompt=negative_prompt,
                     )
-                                    
+
                     prompt = "a photo of " + garment_des
                     negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
                     if not isinstance(prompt, List):
@@ -225,10 +242,10 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                     garm_tensor =  tensor_transfrom(garm_img).unsqueeze(0).to(device,dtype)
                     results = []
                     current_seed = seed
-                    for i in range(number_of_images):  
+                    for i in range(number_of_images):
                         if is_randomize_seed:
-                            current_seed = torch.randint(0, 2**32, size=(1,)).item()                        
-                        generator = torch.Generator(device).manual_seed(current_seed) if seed != -1 else None                     
+                            current_seed = torch.randint(0, 2**32, size=(1,)).item()
+                        generator = torch.Generator(device).manual_seed(current_seed) if seed != -1 else None
                         current_seed = current_seed + i
 
                         images = pipe(
@@ -243,7 +260,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             text_embeds_cloth=prompt_embeds_c.to(device,dtype),
                             cloth = garm_tensor.to(device,dtype),
                             mask_image=mask,
-                            image=human_img, 
+                            image=human_img,
                             height=1024,
                             width=768,
                             ip_adapter_image = garm_img.resize((768,1024)),
@@ -252,15 +269,15 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             device=device,
                         )[0]
                         if is_checked_crop:
-                            out_img = images[0].resize(crop_size)        
-                            human_img_orig.paste(out_img, (int(left), int(top)))   
+                            out_img = images[0].resize(crop_size)
+                            human_img_orig.paste(out_img, (int(left), int(top)))
                             img_path = save_output_image(human_img_orig, base_path="outputs", base_filename='img', seed=current_seed)
                             results.append(img_path)
                         else:
                             img_path = save_output_image(images[0], base_path="outputs", base_filename='img')
                             results.append(img_path)
                     return results, mask_gray
-    
+
 garm_list = os.listdir(os.path.join(example_path,"cloth"))
 garm_list_path = [os.path.join(example_path,"cloth",garm) for garm in garm_list]
 
@@ -319,7 +336,7 @@ with image_blocks as demo:
                 try_button = gr.Button(value="Try-on")
                 denoise_steps = gr.Number(label="Denoising Steps", minimum=20, maximum=120, value=30, step=1)
                 seed = gr.Number(label="Seed", minimum=-1, maximum=2147483647, step=1, value=1)
-                is_randomize_seed = gr.Checkbox(label="Randomize seed for each generated image", value=True)  
+                is_randomize_seed = gr.Checkbox(label="Randomize seed for each generated image", value=True)
                 number_of_images = gr.Number(label="Number Of Images To Generate (it will start from your input seed and increment by 1)", minimum=1, maximum=9999, value=1, step=1)
 
 
