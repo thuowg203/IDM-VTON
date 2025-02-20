@@ -20,6 +20,10 @@ from preprocess.openpose.run_openpose import OpenPose
 from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
 from torchvision.transforms.functional import to_pil_image
 from util.pipeline import quantize_4bit, restart_cpu_offload, torch_gc
+import sys
+
+# Global variable to store the original uploaded image (full resolution)
+ORIGINAL_IMAGE = None  
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--share", type=str, default=False, help="Set to True to share the app publicly.")
@@ -56,8 +60,9 @@ def auto_crop_upload(editor_value, crop_flag):
     """
     When a user uploads an image (EditorValue) and if auto-cropping is enabled 
     (crop_flag is True) this function performs the cropping and resizing.
-    It also updates the "auto_cropped" flag within the EditorValue.
+    It stores the original full resolution image in a global variable and updates the "auto_cropped" flag.
     """
+    global ORIGINAL_IMAGE
     if editor_value is None:
         return None
     if editor_value.get("background") is None:
@@ -65,6 +70,9 @@ def auto_crop_upload(editor_value, crop_flag):
     try:
         img = editor_value["background"].convert("RGB")
         if crop_flag:
+            # Save the original image before cropping so that we can use it later for stitching.
+            ORIGINAL_IMAGE = img.copy()
+            print("auto_crop_upload: Original image stored with resolution:", ORIGINAL_IMAGE.size)
             width, height = img.size
             target_width = int(min(width, height * (3 / 4)))
             target_height = int(min(height, width * (4 / 3)))
@@ -73,7 +81,7 @@ def auto_crop_upload(editor_value, crop_flag):
             right = (width + target_width) / 2
             bottom = (height + target_height) / 2
             cropped_img = img.crop((left, top, right, bottom))
-            # Resize the cropped image to the proper dimensions used by the model.
+            # Resize the cropped image to the proper dimensions used by the model (768×1024)
             resized_img = cropped_img.resize((768, 1024))
             editor_value["background"] = resized_img
             # If there are any drawn layers (mask layers), crop and resize them too.
@@ -89,16 +97,19 @@ def auto_crop_upload(editor_value, crop_flag):
             # Optionally update "composite"
             editor_value["composite"] = resized_img
             editor_value["auto_cropped"] = True
+            print("auto_crop_upload: Cropping done. Crop region:", left, top, right, bottom)
+        else:
+            print("auto_crop_upload: Auto crop flag disabled.")
     except Exception as e:
-        print("Error in auto crop:", e)
+        print("auto_crop_upload: Error in auto crop:", e, file=sys.stderr)
     return editor_value
 
-# --- Modified try-on function to check if auto-cropping was already applied ---
+# --- Modified try-on function to stitch back the generated image ---
 def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_crop, denoise_steps, is_randomize_seed, seed, number_of_images):
-    global pipe, unet, UNet_Encoder, need_restart_cpu_offloading
+    global pipe, unet, UNet_Encoder, need_restart_cpu_offloading, ORIGINAL_IMAGE
 
-    print(f"Input dict from ImageEditor: {dict}")  # Debug: Print the input dict
-    print(f"Full Input dict content: {dict}")  # NEW DEBUG PRINT - Print the entire dict
+    print(f"start_tryon: Input dict from ImageEditor: {dict}")
+    print(f"start_tryon: Full Input dict content: {dict}")
 
     if pipe is None:
         unet = UNet2DConditionModel.from_pretrained(
@@ -181,35 +192,46 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
 
     garm_img = garm_img.convert("RGB").resize((768, 1024))
     human_img_orig = dict["background"].convert("RGB")
+    print("start_tryon: Received human image from editor.")
 
+    # --- New stitching logic when auto-crop is enabled ---
     if is_checked_crop:
-        # If the image has already been auto-cropped via the upload event, then skip cropping.
-        if not dict.get("auto_cropped", False):
-            width, height = human_img_orig.size
-            target_width = int(min(width, height * (3 / 4)))
-            target_height = int(min(height, width * (4 / 3)))
-            left = (width - target_width) / 2
-            top = (height - target_height) / 2
-            right = (width + target_width) / 2
-            bottom = (height + target_height) / 2
-            cropped_img = human_img_orig.crop((left, top, right, bottom))
-            crop_size = cropped_img.size
-            human_img = cropped_img.resize((768, 1024))
+        if ORIGINAL_IMAGE is not None:
+            orig = ORIGINAL_IMAGE
+            print("start_tryon: Using ORIGINAL_IMAGE from global with resolution:", orig.size)
         else:
-            human_img = human_img_orig
-            crop_size = human_img.size
+            orig = human_img_orig
+            print("start_tryon: GLOBAL ORIGINAL_IMAGE not found. Using auto-cropped human image with resolution:", orig.size)
+        orig_w, orig_h = orig.size
+        scale_factor = 1024 / orig_h
+        final_w = int(orig_w * scale_factor)
+        final_h = 1024
+        final_background = orig.resize((final_w, final_h))
+        print(f"start_tryon: Downscaled original image to final background: {final_background.size} (scale factor: {scale_factor})")
+        target_width = int(min(orig_w, orig_h * (3 / 4)))
+        target_height = int(min(orig_h, orig_w * (4 / 3)))
+        left_orig = (orig_w - target_width) / 2
+        top_orig = (orig_h - target_height) / 2
+        left_final = int(left_orig * scale_factor)
+        top_final = int(top_orig * scale_factor)
+        crop_width_final = int(target_width * scale_factor)
+        crop_height_final = int(target_height * scale_factor)
+        crop_size = (crop_width_final, crop_height_final)
+        print(f"start_tryon: Computed crop region on original image: left_orig: {left_orig}, top_orig: {top_orig}, target_width: {target_width}, target_height: {target_height}")
+        print(f"start_tryon: Scaled crop region for final image: left_final: {left_final}, top_final: {top_final}, crop_size: {crop_size}")
+        # Use the already auto-cropped human image as model input since it is 768x1024.
+        human_img = human_img_orig
     else:
         human_img = human_img_orig.resize((768, 1024))
-        crop_size = human_img.size
+        print("start_tryon: Auto crop not enabled, resized human image to 768x1024.")
 
     if is_checked:
         keypoints = openpose_model(human_img.resize((384, 512)))
         model_parse, _ = parsing_model(human_img.resize((384, 512)))
         mask, mask_gray = get_mask_location('hd', category, model_parse, keypoints)
         mask = mask.resize((768, 1024))
-        print("Auto-masking used")
+        print("start_tryon: Auto-masking used")
     else:
-        # Manual mask branch: extract the alpha channel from the drawn layer.
         if dict.get('layers') and len(dict['layers']) > 0 and dict['layers'][0] is not None:
             mask_layer = dict['layers'][0]
             if mask_layer.mode == "RGBA":
@@ -217,14 +239,14 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
             else:
                 mask_alpha = mask_layer.convert("L")
             mask_alpha = mask_alpha.resize((768, 1024))
-            print("Manual mask alpha extracted:", type(mask_alpha), mask_alpha.mode, mask_alpha.size)
+            print("start_tryon: Manual mask alpha extracted:", type(mask_alpha), mask_alpha.mode, mask_alpha.size)
             mask = pil_to_binary_mask(mask_alpha)
-            print("Manual mask binary mask:", type(mask), mask.mode, mask.size)
+            print("start_tryon: Manual mask binary mask:", type(mask), mask.mode, mask.size)
         else:
             mask = Image.new('L', (768, 1024), 0)
-            print("No manual mask provided, using default black mask")
+            print("start_tryon: No manual mask provided, using default black mask")
 
-    print("Mask before pipe:", type(mask), mask.mode, mask.size)
+    print("start_tryon: Mask before pipe:", type(mask), mask.mode, mask.size)
 
     mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
@@ -312,9 +334,12 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             device=device,
                         )[0]
                         if is_checked_crop:
-                            out_img = images[0].resize(crop_size)
-                            human_img_orig.paste(out_img, (int(left), int(top)))
-                            img_path = save_output_image(human_img_orig, base_path="outputs", base_filename='img', seed=current_seed)
+                            final_img = final_background.copy()
+                            # Ensure the generated image is resized to the computed crop_size
+                            gen_img = images[0].resize(crop_size)
+                            final_img.paste(gen_img, (left_final, top_final))
+                            print(f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})")
+                            img_path = save_output_image(final_img, base_path="outputs", base_filename='img', seed=current_seed)
                             results.append(img_path)
                         else:
                             img_path = save_output_image(images[0], base_path="outputs", base_filename='img')
@@ -338,7 +363,7 @@ for ex_human in human_list_path:
 
 image_blocks = gr.Blocks().queue()
 with image_blocks as demo:
-    gr.Markdown("## V14 - IDM-VTON 👕👔👚 improved by SECourses : 1-Click Installers Latest Version On : https://www.patreon.com/posts/103022942")
+    gr.Markdown("## V17 - IDM-VTON 👕👔👚 improved by SECourses : 1-Click Installers Latest Version On : https://www.patreon.com/posts/103022942")
     gr.Markdown("Virtual Try-on with your image and garment image. Check out the [source codes](https://github.com/yisol/IDM-VTON) and the [model](https://huggingface.co/yisol/IDM-VTON)")
     with gr.Row():
         with gr.Column():
