@@ -21,7 +21,6 @@ from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_or
 from torchvision.transforms.functional import to_pil_image
 from util.pipeline import quantize_4bit, restart_cpu_offload, torch_gc
 import sys
-sys.path.append('./ckpt/pifuhd')
 from pifuhd_inference import pifuhd_predict
 
 
