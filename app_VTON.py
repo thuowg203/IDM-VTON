@@ -22,7 +22,7 @@ from torchvision.transforms.functional import to_pil_image
 from util.pipeline import quantize_4bit, restart_cpu_offload, torch_gc
 import sys
 sys.path.append('./ckpt/pifuhd')
-from inference import pifuhd_predict
+from pifuhd_inference import pifuhd_predict
 
 
 # Global variable to store the original uploaded image (full resolution)
