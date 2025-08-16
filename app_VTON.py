@@ -28,7 +28,7 @@ from pifuhd_inference import pifuhd_predict
 ORIGINAL_IMAGE = None  
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--share", type=str, default=False, help="Set to True to share the app publicly.")
+parser.add_argument("--share", action="store_true", default=False, help="Set to True to share the app publicly.")
 parser.add_argument("--lowvram", action="store_true", help="Enable CPU offload for model operations.")
 parser.add_argument("--load_mode", default=None, type=str, choices=["4bit", "8bit"], help="Quantization mode for optimization memory consumption")
 parser.add_argument("--fixed_vae", action="store_true", default=True,  help="Use fixed vae for FP16.")
