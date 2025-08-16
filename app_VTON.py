@@ -21,6 +21,9 @@ from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_or
 from torchvision.transforms.functional import to_pil_image
 from util.pipeline import quantize_4bit, restart_cpu_offload, torch_gc
 import sys
+sys.path.append('./ckpt/pifuhd')
+from inference import pifuhd_predict
+
 
 # Global variable to store the original uploaded image (full resolution)
 ORIGINAL_IMAGE = None  
@@ -307,6 +310,7 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                     pose_img_tensor = tensor_transfrom(pose_img).unsqueeze(0).to(device, dtype)
                     garm_tensor = tensor_transfrom(garm_img).unsqueeze(0).to(device, dtype)
                     results = []
+                    mesh_path = None # Khởi tạo mặc định, phòng trường hợp không sinh mesh
                     current_seed = seed
                     for i in range(number_of_images):
                         if is_randomize_seed:
@@ -338,13 +342,24 @@ def start_tryon(dict, garm_img, garment_des, category, is_checked, is_checked_cr
                             # Ensure the generated image is resized to the computed crop_size
                             gen_img = images[0].resize(crop_size)
                             final_img.paste(gen_img, (left_final, top_final))
-                            print(f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})")
+
+                            # Lưu ảnh tạm với tên temp_tryon_...png
+                            temp_tryon_path = f"temp_tryon_{current_seed}.png"
+                            final_img.save(temp_tryon_path)
+                            print(f"Temporary image saved at {temp_tryon_path}")
+                            # Gọi PIFuHD để sinh mesh từ ảnh try-on
+                            mesh_path = pifuhd_predict(temp_tryon_path)
+                            print(f"Mesh saved at: {mesh_path}")
+
+                            #print(f"start_tryon: Pasted generated image onto final background at ({left_final}, {top_final})")
                             img_path = save_output_image(final_img, base_path="outputs", base_filename='img', seed=current_seed)
-                            results.append(img_path)
+                            #results.append(img_path)
+                            results.append(mesh_path)
                         else:
                             img_path = save_output_image(images[0], base_path="outputs", base_filename='img')
                             results.append(img_path)
-                    return results, mask_gray
+                    #return results, mask_gray
+                    return results, mask_gray, mesh_path
 
 garm_list = os.listdir(os.path.join(example_path, "cloth"))
 garm_list_path = [os.path.join(example_path, "cloth", garm) for garm in garm_list]
@@ -406,6 +421,9 @@ with image_blocks as demo:
         with gr.Column():
             with gr.Row():
                 image_gallery = gr.Gallery(label="Generated Images", show_label=True)
+                #
+            with gr.Row():
+                model3d_viewer = gr.Model3D(label="3D Mesh Output", clear_color=[1,1,1,1], camera_position=(0, 0, 1.5))
             with gr.Row():
                 try_button = gr.Button(value="Try-on")
                 denoise_steps = gr.Number(label="Denoising Steps", minimum=20, maximum=120, value=30, step=1)
@@ -416,7 +434,8 @@ with image_blocks as demo:
     try_button.click(
         fn=start_tryon,
         inputs=[imgs, garm_img, prompt, category, is_checked, is_checked_crop, denoise_steps, is_randomize_seed, seed, number_of_images],
-        outputs=[image_gallery, masked_img],
+        #outputs=[image_gallery, masked_img],
+        outputs=[image_gallery, masked_img, model3d_viewer],
         api_name='tryon'
     )
 
